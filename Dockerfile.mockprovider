@@ -1,0 +1,20 @@
+# Use an appropriate OpenJDK base image
+FROM eclipse-temurin:11-jre-focal
+
+# Set working directory
+WORKDIR /app
+
+# Copy the fat JAR from the Maven build context
+# The shaded JAR name is based on <artifactId>-<version>-shaded.jar
+# We use the same fat JAR as the main streams application.
+COPY target/realtime-index-system-1.0-SNAPSHOT-shaded.jar app.jar
+
+# Environment variables for configuration (with defaults set in the application)
+ENV KAFKA_BOOTSTRAP_SERVERS="kafka:9092"
+ENV NUM_INSTRUMENTS="100" # Default for the mock provider
+ENV MSGS_PER_SEC_PER_INST="1" # Default for the mock provider
+# Add any other environment variables your main class might need
+
+# Command to run the application
+# We need to specify the main class for the MockMarketDataProvider
+ENTRYPOINT ["java", "-cp", "app.jar", "com.example.indexsystem.provider.mock.MockMarketDataProvider"]

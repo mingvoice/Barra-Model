@@ -1,0 +1,93 @@
+version: '3.8'
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.2 # Using a version that's generally compatible
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:7.3.2
+    container_name: kafka
+    ports:
+      - "9092:9092" # For local access to Kafka brokers if needed
+      - "29092:29092" # For access from other containers on the same Docker network
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_CONFLUENT_LICENSE_TOPIC_REPLICATION_FACTOR: 1 # Required for cp-kafka images
+      KAFKA_CONFLUENT_BALANCER_TOPIC_REPLICATION_FACTOR: 1 # Required for cp-kafka images
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1 # Required for cp-kafka images
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1 # Required for cp-kafka images
+    healthcheck:
+        test: ["CMD-SHELL", "kafka-topics --bootstrap-server kafka:29092 --list || exit 1"]
+        interval: 10s
+        timeout: 5s
+        retries: 5
+
+  redis:
+    image: redis:7.0-alpine # Using a recent Alpine version
+    container_name: redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+        test: ["CMD", "redis-cli", "ping"]
+        interval: 5s
+        timeout: 2s
+        retries: 5
+
+
+  index-calculator-app:
+    build:
+      context: .
+      dockerfile: Dockerfile # Main application Dockerfile
+    container_name: index-calculator-app
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:29092" # Internal Docker network listener
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      # Optional: Configure logging level for the app
+      # JAVA_LOGGING_LEVEL: "INFO" 
+    # If you need to ensure topics are created before app starts, you might need a custom wait script
+    # or manage topics externally. For simplicity, this compose file assumes topics are auto-created or pre-exist.
+
+  mock-data-provider-app:
+    build:
+      context: .
+      dockerfile: Dockerfile.mockprovider # Dockerfile for the mock provider
+    container_name: mock-data-provider-app
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:29092" # Internal Docker network listener
+      NUM_INSTRUMENTS: "50" # Example: Generate 50 instruments
+      MSGS_PER_SEC_PER_INST: "2" # Example: 2 messages per second per instrument
+      # JAVA_LOGGING_LEVEL: "INFO"
+    # This service will continuously run and produce data.
+    # No specific ports exposed unless the mock provider itself has an API.
+
+# Optional: Define a network if you want more control, though Docker Compose creates a default one.
+# networks:
+#   index_system_net:
+
+# Optional: Define volumes for data persistence if needed (e.g., for Zookeeper, Kafka data)
+# volumes:
+#   zookeeper_data:
+#   kafka_data:
+#   redis_data:

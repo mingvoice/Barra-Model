@@ -1,253 +1,162 @@
 package com.example.indexsystem.engine;
 
+import com.example.indexsystem.cache.RedisManager; // Added for query methods
 import com.example.indexsystem.model.CalculatedIndexValue;
-import com.example.indexsystem.model.IndexDefinition;
-import com.example.indexsystem.model.Instrument;
-import com.example.indexsystem.model.InstrumentWeight;
-import com.example.indexsystem.model.MarketData;
-import com.example.indexsystem.service.IndexCalculator;
+import com.example.indexsystem.model.IndexDefinition; // Keep for getAllLatestIndexValues example
+import com.example.indexsystem.registry.InMemoryIndexRegistry; // Keep for instanceof check
 import com.example.indexsystem.service.IndexRegistry;
-import com.example.indexsystem.service.MarketDataListener;
 import com.example.indexsystem.service.MarketDataProvider;
-import com.example.indexsystem.service.exception.SubscriptionException;
+import com.example.indexsystem.streaming.IndexCalculationStreamTopology; // For managing streams app lifecycle
 
+// Kafka related imports are removed as Kafka consumption is now handled by Kafka Streams
+// import com.example.indexsystem.service.MarketDataListener; // If no other direct listening
+// import com.example.indexsystem.service.exception.SubscriptionException;
+
+import java.util.Collection; // Keep if needed for IndexRegistry
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.HashSet;
+import java.util.List; // Keep for getAllLatestIndexValues example
 import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
+// import java.util.Properties; // No longer needed for Kafka Consumer properties here
+// import java.util.Set; // No longer needed for instrumentToIndicesMap
+// import java.util.concurrent.ConcurrentHashMap; // No longer needed for internal state maps
+// import java.util.concurrent.ExecutorService; // No longer needed for Kafka Consumer thread here
+// import java.util.concurrent.Executors; // No longer needed for Kafka Consumer thread here
+// import java.util.concurrent.TimeUnit; // No longer needed for Kafka Consumer thread here
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * Orchestrates the real-time calculation of indices.
- * This service loads index definitions, subscribes to market data for constituent instruments,
- * receives market data updates, triggers index recalculations, and stores the latest calculated values.
+ * Manages index definitions, orchestrates the loading of these definitions into Redis,
+ * and controls the lifecycle of the Kafka Streams application.
+ * It can also provide an API to query the latest index values from Redis.
  */
-public class RealTimeIndexService implements MarketDataListener {
+public class RealTimeIndexService { // No longer implements MarketDataListener
 
     private static final Logger LOGGER = Logger.getLogger(RealTimeIndexService.class.getName());
 
     private final IndexRegistry indexRegistry;
-    private final MarketDataProvider marketDataProvider;
-    private final Map<String, IndexCalculator> calculators;
-
-    // Concurrent collections for thread safety
-    private final Map<Instrument, Set<IndexDefinition>> instrumentToIndicesMap;
-    private final Map<Instrument, MarketData> currentMarketDataState;
-    private final Map<String, CalculatedIndexValue> latestIndexValues;
+    private final MarketDataProvider marketDataProvider; // Retained for now, if it has other uses
+    private final RedisManager redisManager; // For querying results and loading definitions
+    private IndexCalculationStreamTopology streamsApp; // To manage Kafka Streams app lifecycle
+    private final String kafkaBootstrapServers; // Needed to start the streams app
 
     /**
      * Constructs a RealTimeIndexService.
      *
-     * @param indexRegistry      The registry to access index definitions.
-     * @param marketDataProvider The provider for market data.
-     * @param calculators        A map of calculation algorithm names to {@link IndexCalculator} implementations.
+     * @param indexRegistry         The registry to access index definitions.
+     * @param marketDataProvider    Optional provider for other market data needs or direct publishing. Can be null.
+     * @param redisManager          Manager for Redis interactions. Cannot be null.
+     * @param kafkaBootstrapServers Kafka bootstrap servers for the streams application. Cannot be null or empty.
+     * @throws IllegalArgumentException if indexRegistry, redisManager or kafkaBootstrapServers is null/empty.
      */
     public RealTimeIndexService(IndexRegistry indexRegistry, MarketDataProvider marketDataProvider,
-                                Map<String, IndexCalculator> calculators) {
-        if (indexRegistry == null) {
-            throw new IllegalArgumentException("IndexRegistry cannot be null.");
-        }
-        if (marketDataProvider == null) {
-            throw new IllegalArgumentException("MarketDataProvider cannot be null.");
-        }
-        if (calculators == null) {
-            throw new IllegalArgumentException("Calculators map cannot be null.");
+                                RedisManager redisManager, String kafkaBootstrapServers) {
+        if (indexRegistry == null) throw new IllegalArgumentException("IndexRegistry cannot be null.");
+        if (redisManager == null) throw new IllegalArgumentException("RedisManager cannot be null.");
+        if (kafkaBootstrapServers == null || kafkaBootstrapServers.trim().isEmpty()) {
+            throw new IllegalArgumentException("Kafka Bootstrap Servers cannot be null or empty.");
         }
 
         this.indexRegistry = indexRegistry;
-        this.marketDataProvider = marketDataProvider;
-        this.calculators = new HashMap<>(calculators); // Defensive copy
+        this.marketDataProvider = marketDataProvider; // Can be null
+        this.redisManager = redisManager;
+        this.kafkaBootstrapServers = kafkaBootstrapServers;
 
-        this.instrumentToIndicesMap = new ConcurrentHashMap<>();
-        this.currentMarketDataState = new ConcurrentHashMap<>();
-        this.latestIndexValues = new ConcurrentHashMap<>();
-
-        init();
+        initService();
     }
 
-    /**
-     * Initializes the service by loading index definitions and subscribing to market data.
-     */
-    private void init() {
+    private void initService() {
         LOGGER.info("Initializing RealTimeIndexService...");
-        Collection<IndexDefinition> definitions = indexRegistry.getAllIndices();
-        if (definitions == null || definitions.isEmpty()) {
-            LOGGER.warning("No index definitions found in the registry. Service will be idle.");
-            return;
-        }
-
-        for (IndexDefinition definition : definitions) {
-            if (definition == null || definition.getIndexId() == null) {
-                LOGGER.warning("Encountered a null index definition or definition with null ID. Skipping.");
-                continue;
-            }
-            LOGGER.log(Level.INFO, "Loading index definition: {0} ({1}) with algorithm: {2}",
-                       new Object[]{definition.getName(), definition.getIndexId(), definition.getCalculationAlgorithm()});
-
-            if (!calculators.containsKey(definition.getCalculationAlgorithm())) {
-                LOGGER.log(Level.SEVERE, "No calculator found for algorithm: {0} required by index: {1}. This index will not be calculated.",
-                           new Object[]{definition.getCalculationAlgorithm(), definition.getIndexId()});
-                continue; // Skip this index if no calculator is available
-            }
-
-            if (definition.getConstituents() == null || definition.getConstituents().isEmpty()) {
-                LOGGER.log(Level.WARNING, "Index definition {0} has no constituents. Skipping subscriptions for this index.", definition.getIndexId());
-                continue;
-            }
-
-            for (InstrumentWeight constituentWeight : definition.getConstituents()) {
-                if (constituentWeight == null || constituentWeight.getInstrument() == null) {
-                    LOGGER.warning("Null constituent or instrument found in index: " + definition.getIndexId() + ". Skipping.");
-                    continue;
-                }
-                Instrument instrument = constituentWeight.getInstrument();
-
-                // Add mapping from instrument to this index definition
-                instrumentToIndicesMap.computeIfAbsent(instrument, k -> ConcurrentHashMap.newKeySet()).add(definition);
-
-                // Subscribe to market data for this instrument
-                try {
-                    LOGGER.log(Level.INFO, "Subscribing to market data for instrument: {0} for index: {1}",
-                               new Object[]{instrument.getSymbol(), definition.getIndexId()});
-                    marketDataProvider.subscribe(instrument, this);
-                } catch (SubscriptionException e) {
-                    LOGGER.log(Level.SEVERE, "Failed to subscribe to instrument " + instrument.getSymbol() +
-                                             " for index " + definition.getIndexId(), e);
-                    // Depending on policy, we might want to stop or continue
-                } catch (Exception e) {
-                    LOGGER.log(Level.SEVERE, "An unexpected error occurred during subscription for instrument " +
-                                             instrument.getSymbol() + " for index " + definition.getIndexId(), e);
-                }
-            }
+        // Load index definitions into Redis using the provided IndexRegistry
+        if (this.indexRegistry instanceof InMemoryIndexRegistry) {
+            LOGGER.info("Loading index definitions into Redis via InMemoryIndexRegistry...");
+            ((InMemoryIndexRegistry) this.indexRegistry).loadDefinitionsIntoRedis();
+        } else {
+            LOGGER.warning("IndexRegistry is not an InMemoryIndexRegistry. Ensure definitions are loaded into Redis by other means if needed by Streams app.");
         }
         LOGGER.info("RealTimeIndexService initialization complete.");
     }
 
     /**
-     * Called by the {@link MarketDataProvider} when new market data is received.
-     * This method updates the internal market data state and triggers recalculation
-     * for all affected indices.
-     *
-     * @param data The new {@link MarketData} update.
+     * Starts the associated Kafka Streams application for index calculation.
      */
-    @Override
-    public void onMarketData(MarketData data) {
-        if (data == null || data.getInstrument() == null) {
-            LOGGER.warning("Received null market data or data with null instrument. Ignoring.");
+    public void startProcessing() {
+        if (streamsApp != null && streamsApp.isRunning()) { // Assuming streamsApp has an isRunning() method
+            LOGGER.warning("Kafka Streams application is already running.");
             return;
         }
-        Instrument updatedInstrument = data.getInstrument();
-        LOGGER.log(Level.FINE, "Received market data update for {0}: {1}", new Object[]{updatedInstrument.getSymbol(), data});
-
-        // Update the current state for this instrument
-        currentMarketDataState.put(updatedInstrument, data);
-
-        // Identify affected indices
-        Set<IndexDefinition> affectedIndices = instrumentToIndicesMap.get(updatedInstrument);
-        if (affectedIndices == null || affectedIndices.isEmpty()) {
-            LOGGER.log(Level.FINE, "No indices are affected by market data for instrument: {0}", updatedInstrument.getSymbol());
-            return;
-        }
-
-        for (IndexDefinition indexDef : affectedIndices) {
-            LOGGER.log(Level.FINER, "Recalculating index {0} due to update for {1}", new Object[]{indexDef.getIndexId(), updatedInstrument.getSymbol()});
-
-            IndexCalculator calculator = calculators.get(indexDef.getCalculationAlgorithm());
-            if (calculator == null) {
-                LOGGER.log(Level.SEVERE, "No calculator found for algorithm: {0} of index: {1} during onMarketData. Skipping calculation.",
-                           new Object[]{indexDef.getCalculationAlgorithm(), indexDef.getIndexId()});
-                continue;
-            }
-
-            // Gather all necessary market data for this specific index
-            Map<Instrument, MarketData> relevantMarketDataForIndex = new HashMap<>();
-            boolean allDataAvailable = true;
-            if (indexDef.getConstituents() == null) {
-                 LOGGER.log(Level.WARNING, "Index definition {0} has null constituents list during onMarketData. Skipping.", indexDef.getIndexId());
-                 continue;
-            }
-
-            for (InstrumentWeight iw : indexDef.getConstituents()) {
-                if (iw == null || iw.getInstrument() == null) {
-                    LOGGER.warning("Null constituent or instrument in index " + indexDef.getIndexId() + " during onMarketData. Skipping this constituent.");
-                    continue;
-                }
-                Instrument constituentInstrument = iw.getInstrument();
-                MarketData constituentData = currentMarketDataState.get(constituentInstrument);
-                if (constituentData == null) {
-                    // Data for this constituent hasn't arrived yet or is missing
-                    // The calculator implementation should handle this (e.g., by skipping or using stale data if designed to)
-                    LOGGER.log(Level.FINER, "Market data for constituent {0} of index {1} is not yet available in currentMarketDataState.",
-                               new Object[]{constituentInstrument.getSymbol(), indexDef.getIndexId()});
-                    allDataAvailable = false; // Or specific handling based on index calculation rules
-                    // For now, we will pass nulls to the calculator to decide
-                }
-                relevantMarketDataForIndex.put(constituentInstrument, constituentData);
-            }
-            
-            // If a calculator strictly needs all data, you might check allDataAvailable here.
-            // However, it's often better to let the calculator decide how to handle missing constituent data.
-
-            try {
-                CalculatedIndexValue newIndexValue = calculator.calculate(indexDef, relevantMarketDataForIndex);
-                if (newIndexValue != null) {
-                    latestIndexValues.put(indexDef.getIndexId(), newIndexValue);
-                    LOGGER.log(Level.INFO, "Calculated Index [{0} ({1})]: {2} at {3}",
-                               new Object[]{indexDef.getName(), newIndexValue.getIndexId(), newIndexValue.getValue(), newIndexValue.getTimestamp()});
-                } else {
-                    LOGGER.log(Level.WARNING, "Calculator for index {0} returned null value.", indexDef.getIndexId());
-                }
-            } catch (Exception e) {
-                LOGGER.log(Level.SEVERE, "Error calculating index " + indexDef.getIndexId(), e);
-            }
+        LOGGER.info("Starting Kafka Streams application (IndexCalculationStreamTopology)...");
+        streamsApp = new IndexCalculationStreamTopology(this.kafkaBootstrapServers, this.redisManager);
+        try {
+            streamsApp.start(); 
+            LOGGER.info("Kafka Streams application (IndexCalculationStreamTopology) started successfully.");
+        } catch (Exception e) {
+            LOGGER.log(Level.SEVERE, "Failed to start IndexCalculationStreamTopology", e);
+            streamsApp = null; // Ensure it's null if start failed
         }
     }
 
     /**
-     * Retrieves the latest calculated value for a given index ID.
+     * Stops the associated Kafka Streams application.
+     */
+    public void stopProcessing() {
+        if (streamsApp != null) {
+            LOGGER.info("Stopping Kafka Streams application (IndexCalculationStreamTopology)...");
+            streamsApp.stop();
+            streamsApp = null; 
+            LOGGER.info("Kafka Streams application (IndexCalculationStreamTopology) stopped.");
+        } else {
+            LOGGER.info("Kafka Streams application was not running or not initialized by this service.");
+        }
+    }
+
+    /**
+     * Retrieves the latest calculated value for a given index ID from Redis.
      *
      * @param indexId The ID of the index.
-     * @return The {@link CalculatedIndexValue}, or {@code null} if not found or not yet calculated.
+     * @return The {@link CalculatedIndexValue}, or {@code null} if not found.
      */
     public CalculatedIndexValue getLatestIndexValue(String indexId) {
-        if (indexId == null) {
-            return null;
-        }
-        return latestIndexValues.get(indexId);
+        if (indexId == null) return null;
+        LOGGER.log(Level.FINE, "Querying Redis for latest value of index: {0}", indexId);
+        return redisManager.getCalculatedIndexValue(indexId);
     }
 
     /**
-     * Returns an unmodifiable copy of the map containing all latest calculated index values.
+     * Returns an unmodifiable map containing all latest calculated index values from Redis.
+     * This implementation fetches values for indices known to the local IndexRegistry.
      *
      * @return A map of index IDs to their latest {@link CalculatedIndexValue}.
      */
     public Map<String, CalculatedIndexValue> getAllLatestIndexValues() {
-        return Collections.unmodifiableMap(new HashMap<>(latestIndexValues)); // Return a copy
+        LOGGER.log(Level.INFO, "Querying Redis for all latest index values based on local IndexRegistry definitions.");
+        Map<String, CalculatedIndexValue> values = new HashMap<>();
+        List<IndexDefinition> definitions = indexRegistry.getAllIndices(); // From local memory
+        for (IndexDefinition def : definitions) {
+            CalculatedIndexValue val = redisManager.getCalculatedIndexValue(def.getIndexId());
+            if (val != null) {
+                values.put(def.getIndexId(), val);
+            }
+        }
+        return Collections.unmodifiableMap(values);
     }
 
     /**
-     * Shuts down the service, unsubscribing from all market data.
+     * Shuts down the RealTimeIndexService.
+     * This includes stopping the Kafka Streams application if managed,
+     * and disconnecting the MarketDataProvider if used.
      */
     public void shutdown() {
         LOGGER.info("Shutting down RealTimeIndexService...");
-        if (marketDataProvider != null) {
-            // Unsubscribe from all instruments
-            // instrumentToIndicesMap contains all instruments we've subscribed to as keys
-            for (Instrument instrument : instrumentToIndicesMap.keySet()) {
-                try {
-                    LOGGER.log(Level.INFO, "Unsubscribing from instrument: {0}", instrument.getSymbol());
-                    marketDataProvider.unsubscribe(instrument, this);
-                } catch (Exception e) {
-                    LOGGER.log(Level.WARNING, "Error unsubscribing from instrument " + instrument.getSymbol(), e);
-                }
-            }
+        stopProcessing(); // Stop the Kafka Streams application
+
+        if (marketDataProvider != null && marketDataProvider.isConnected()) {
+            LOGGER.info("Disconnecting MarketDataProvider...");
+            marketDataProvider.disconnect();
         }
-        instrumentToIndicesMap.clear();
-        currentMarketDataState.clear();
-        latestIndexValues.clear();
+        // RedisManager is managed by IndexCalculationStreamTopology, which should close it on its stop().
+        // If this service had its own RedisManager instance not shared, it would be closed here.
         LOGGER.info("RealTimeIndexService shut down complete.");
     }
 }
